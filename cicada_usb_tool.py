@@ -619,8 +619,7 @@ $disks = Get-Disk | Where-Object {
 } | Sort-Object Number
 $result = @()
 foreach ($d in $disks) {
-    $model = (Get-PhysicalDisk -DeviceNumber $d.Number -ErrorAction SilentlyContinue).FriendlyName
-    if (-not $model) { $model = $d.FriendlyName }
+    $model = $d.FriendlyName
     if (-not $model) { $model = 'USB Device' }
     $result += [PSCustomObject]@{
         Number = [int]$d.Number
@@ -645,7 +644,8 @@ MIN_CICADA_P1_BYTES = 2 * 1024**3
 BOOT_PARTITION_BYTES = BOOT_PARTITION_MB * 1024 * 1024
 BOOT_PARTITION_TOLERANCE_BYTES = 256 * 1024 * 1024
 _USB_SCAN_CACHE: tuple[float, list[UsbDisk]] | None = None
-_USB_SCAN_CACHE_TTL = 5.0
+_USB_SCAN_CACHE_TTL = 30.0
+_USB_SCAN_CACHE_EMPTY_TTL = 2.0
 _USB_SCAN_CACHE_LOCK = threading.Lock()
 _NTFS_DISK_LOCKS: dict[int, threading.Lock] = {}
 _NTFS_DISK_LOCKS_GUARD = threading.Lock()
@@ -1158,99 +1158,180 @@ if (-not $p1 -or -not $p2) {{ 'false'; return }}
     )
 
 
-def list_usb_disks_fast() -> list[UsbDisk]:
+def _get_partition_mbr_type(disk_number: int, partition_number: int) -> int | None:
     script = rf"""
-$BootMb = {BOOT_PARTITION_MB}
-$BootTolMb = 256
-$MinP1Mb = 2048
+$ErrorActionPreference = 'SilentlyContinue'
+$p = Get-Partition -DiskNumber {disk_number} -PartitionNumber {partition_number}
+if (-not $p) {{ return }}
+[int]$p.MbrType
+"""
+    raw = run_powershell(script).strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
-function Test-CicadaLayout($disk, $parts) {{
-    if ($disk.PartitionStyle -ne 'MBR' -or $parts.Count -lt 2) {{ return $false }}
-    $p1 = $parts | Where-Object PartitionNumber -eq 1 | Select-Object -First 1
-    $p2 = $parts | Where-Object PartitionNumber -eq 2 | Select-Object -First 1
-    if (-not $p1 -or -not $p2) {{ return $false }}
-    $p1Mb = [double]$p1.Size / 1MB
-    $p2Mb = [double]$p2.Size / 1MB
-    $p1Ok = ($p1Mb -gt $MinP1Mb) -and ($p1.MbrType -in @(7, 17, 23))
-    $p2Ok = ([math]::Abs($p2Mb - $BootMb) -le $BootTolMb) -and ($p2.MbrType -in @(17, 28))
-    return ($p1Ok -and $p2Ok)
-}}
 
-$disks = Get-Disk | Where-Object {{
+def deep_audit_usb_disk(disk: UsbDisk) -> UsbDisk:
+    """Глубокая проверка после fast scan: collision, repair, layout, видимость P1."""
+    from cicada_errors import debug_log
+
+    disk_number = disk.number
+    layout_ok = disk.fast_is_cicada_layout
+    signature_ok = disk.fast_is_cicada_signature
+    collision_offline = disk.mbr_collision_offline
+
+    debug_log(f"[DEEP] audit started disk={disk_number}")
+
+    if signature_ok and collision_offline:
+        resolve_cicada_mbr_collision_offline(
+            disk_number,
+            signature=disk.signature,
+            unique_id=disk.unique_id,
+            log_prefix="[DEEP]",
+        )
+        layout_ok = fast_detect_cicada_disk(disk_number)
+        collision_offline = False
+
+    if signature_ok and not layout_ok:
+        p1_mbr = _get_partition_mbr_type(disk_number, 1)
+        if p1_mbr is not None and int(p1_mbr) in {17, 23}:
+            if repair_wrong_cicada_ntfs_hidden_type(disk_number):
+                layout_ok = fast_detect_cicada_disk(disk_number)
+
+    if signature_ok and layout_ok:
+        _verify_cicada_layout_partitions(disk_number)
+
+    is_cicada = signature_ok and layout_ok
+    if is_cicada:
+        ensure_first_partition_visible(disk_number)
+
+    updated = _copy_usb_disk(disk)
+    updated.fast_is_cicada_layout = layout_ok
+    updated.is_cicada = is_cicada
+    updated.mbr_collision_offline = collision_offline
+    debug_log(
+        f"[DEEP] audit finished disk={disk_number} "
+        f"layout={str(layout_ok).lower()} cicada={str(is_cicada).lower()}"
+    )
+    return updated
+
+
+def list_usb_disks_fast() -> list[UsbDisk]:
+    from cicada_errors import debug_log
+
+    total_started = time.perf_counter()
+    disk_script = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$disks = Get-Disk | Where-Object {
     ($_.BusType -eq 'USB' -or $_.BusType -eq 'SD') -and $_.Size -gt 0
-}} | Sort-Object Number
-
+} | Sort-Object Number
 $result = @()
-foreach ($d in $disks) {{
-    $model = (Get-PhysicalDisk -DeviceNumber $d.Number -ErrorAction SilentlyContinue).FriendlyName
-    if (-not $model) {{ $model = $d.FriendlyName }}
-    if (-not $model) {{ $model = 'USB Device' }}
-    $parts = @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue | Sort-Object PartitionNumber)
-    $p1 = $parts | Where-Object PartitionNumber -eq 1 | Select-Object -First 1
-    $p2 = $parts | Where-Object PartitionNumber -eq 2 | Select-Object -First 1
-    $result += [PSCustomObject]@{{
+foreach ($d in $disks) {
+    $model = $d.FriendlyName
+    if (-not $model) { $model = 'USB Device' }
+    $result += [PSCustomObject]@{
         Number = [int]$d.Number
         Model = [string]$model
         Size = [long]$d.Size
         PartitionStyle = [string]$d.PartitionStyle
-        PartitionCount = [int]$parts.Count
-        P1Size = if ($p1) {{ [long]$p1.Size }} else {{ [long]0 }}
-        P1MbrType = if ($p1) {{ [int]$p1.MbrType }} else {{ [int]0 }}
-        P1IsHidden = if ($p1) {{ [bool]$p1.IsHidden }} else {{ $false }}
-        P2Size = if ($p2) {{ [long]$p2.Size }} else {{ [long]0 }}
-        P2MbrType = if ($p2) {{ [int]$p2.MbrType }} else {{ [int]0 }}
-        P2IsHidden = if ($p2) {{ [bool]$p2.IsHidden }} else {{ $false }}
-        Signature = if ($null -eq $d.Signature) {{ $null }} else {{ [string]$d.Signature }}
+        Signature = if ($null -eq $d.Signature) { $null } else { [string]$d.Signature }
         UniqueId = [string]$d.UniqueId
         IsOffline = [bool]$d.IsOffline
-        OfflineReason = if ($d.PSObject.Properties.Name -contains 'OfflineReason') {{ [string]$d.OfflineReason }} else {{ $null }}
+        OfflineReason = if ($d.PSObject.Properties.Name -contains 'OfflineReason') { [string]$d.OfflineReason } else { $null }
         OperationalStatus = [string]$d.OperationalStatus
-        FastIsCicadaLayout = [bool](Test-CicadaLayout $d $parts)
+    }
+}
+$result | ConvertTo-Json -Compress
+"""
+    disk_started = time.perf_counter()
+    raw_disks = run_powershell(disk_script, timeout=60.0)
+    perf_log("Get-Disk", disk_started)
+    if not raw_disks or raw_disks == "null":
+        perf_log("Get-Partition", time.perf_counter())
+        perf_log("list_usb_disks_fast total", total_started)
+        return []
+
+    disk_items = json.loads(raw_disks)
+    if isinstance(disk_items, dict):
+        disk_items = [disk_items]
+    if not disk_items:
+        perf_log("Get-Partition", time.perf_counter())
+        perf_log("list_usb_disks_fast total", total_started)
+        return []
+
+    numbers = [int(item["Number"]) for item in disk_items]
+    nums_csv = ",".join(str(n) for n in numbers)
+    part_script = rf"""
+$ErrorActionPreference = 'SilentlyContinue'
+$BootMb = {BOOT_PARTITION_MB}
+$BootTolMb = 256
+$MinP1Mb = 2048
+$nums = @({nums_csv})
+$parts = @(Get-Partition | Where-Object {{ $_.DiskNumber -in $nums }} | Sort-Object DiskNumber, PartitionNumber)
+$result = @()
+foreach ($dn in $nums) {{
+    $diskParts = @($parts | Where-Object DiskNumber -eq $dn)
+    $p1 = $diskParts | Where-Object PartitionNumber -eq 1 | Select-Object -First 1
+    $p2 = $diskParts | Where-Object PartitionNumber -eq 2 | Select-Object -First 1
+    $layoutOk = $false
+    if ($p1 -and $p2) {{
+        $p1Mb = [double]$p1.Size / 1MB
+        $p2Mb = [double]$p2.Size / 1MB
+        $p1Ok = ($p1Mb -gt $MinP1Mb) -and ($p1.MbrType -in @(7, 17, 23))
+        $p2Ok = ([math]::Abs($p2Mb - $BootMb) -le $BootTolMb) -and ($p2.MbrType -in @(17, 28))
+        $layoutOk = ($p1Ok -and $p2Ok)
+    }}
+    $result += [PSCustomObject]@{{
+        Number = [int]$dn
+        PartitionCount = [int]$diskParts.Count
+        P1Size = if ($p1) {{ [long]$p1.Size }} else {{ [long]0 }}
+        P1MbrType = if ($p1) {{ [int]$p1.MbrType }} else {{ [int]0 }}
+        P1Letter = if ($p1 -and $p1.DriveLetter) {{ [string]$p1.DriveLetter }} else {{ $null }}
+        P2Size = if ($p2) {{ [long]$p2.Size }} else {{ [long]0 }}
+        P2MbrType = if ($p2) {{ [int]$p2.MbrType }} else {{ [int]0 }}
+        P2Letter = if ($p2 -and $p2.DriveLetter) {{ [string]$p2.DriveLetter }} else {{ $null }}
+        FastIsCicadaLayout = [bool]$layoutOk
     }}
 }}
 $result | ConvertTo-Json -Compress
 """
-    raw = run_powershell(script, timeout=120.0)
-    if not raw or raw == "null":
-        return []
-    data = json.loads(raw)
-    if isinstance(data, dict):
-        data = [data]
-    from cicada_errors import debug_log
+    part_started = time.perf_counter()
+    raw_parts = run_powershell(part_script, timeout=60.0)
+    perf_log("Get-Partition", part_started)
+    part_by_disk: dict[int, dict] = {}
+    if raw_parts and raw_parts != "null":
+        part_items = json.loads(raw_parts)
+        if isinstance(part_items, dict):
+            part_items = [part_items]
+        for part_item in part_items:
+            part_by_disk[int(part_item["Number"])] = part_item
 
     disks: list[UsbDisk] = []
-    for item in data:
-        signature = item.get("Signature")
-        unique_id = item.get("UniqueId")
-        layout_ok = bool(item.get("FastIsCicadaLayout"))
+    for item in disk_items:
+        disk_number = int(item["Number"])
+        part_item = part_by_disk.get(disk_number, {})
+        partition_style = str(item.get("PartitionStyle", ""))
+        layout_ok = bool(part_item.get("FastIsCicadaLayout"))
+        if layout_ok and partition_style.upper() != "MBR":
+            layout_ok = False
         if not layout_ok:
             layout_ok = detect_cicada_layout(
-                partition_style=str(item.get("PartitionStyle", "")),
-                partition_count=int(item.get("PartitionCount", 0)),
-                p1_size=int(item.get("P1Size", 0)),
-                p1_mbr=int(item.get("P1MbrType", 0)),
-                p2_size=int(item.get("P2Size", 0)),
-                p2_mbr=int(item.get("P2MbrType", 0)),
+                partition_style=partition_style,
+                partition_count=int(part_item.get("PartitionCount", 0)),
+                p1_size=int(part_item.get("P1Size", 0)),
+                p1_mbr=int(part_item.get("P1MbrType", 0)),
+                p2_size=int(part_item.get("P2Size", 0)),
+                p2_mbr=int(part_item.get("P2MbrType", 0)),
             )
-        disk_number = int(item["Number"])
+        signature = item.get("Signature")
+        unique_id = item.get("UniqueId")
         signature_ok = _signature_matches_cicada(signature, unique_id)
         is_offline = bool(item.get("IsOffline"))
         offline_reason = str(item.get("OfflineReason") or "")
         collision_offline = is_offline and offline_reason == "Collision"
-        if signature_ok and collision_offline:
-            resolve_cicada_mbr_collision_offline(
-                disk_number,
-                signature=signature,
-                unique_id=unique_id,
-                log_prefix="[SCAN]",
-            )
-            layout_ok = fast_detect_cicada_disk(disk_number)
-        if signature_ok and not layout_ok and int(item.get("P1MbrType", 0)) in {
-            17,
-            23,
-        }:
-            if repair_wrong_cicada_ntfs_hidden_type(disk_number):
-                layout_ok = fast_detect_cicada_disk(disk_number)
         is_cicada = signature_ok and layout_ok
         identity_key = _disk_store_key(
             disk_number,
@@ -1258,11 +1339,17 @@ $result | ConvertTo-Json -Compress
             model=str(item["Model"]),
             size_bytes=int(item["Size"]),
         )
+        p1_letter = part_item.get("P1Letter")
+        p2_letter = part_item.get("P2Letter")
         debug_log(
             f"[SCAN] disk {disk_number} signature: "
             f"{signature if signature is not None else '—'} / unique_id={unique_id or '—'}"
         )
         debug_log(f"[SCAN] disk identity key: {identity_key}")
+        debug_log(
+            f"[SCAN] disk {disk_number} style={partition_style} "
+            f"p1={p1_letter or '—'} p2={p2_letter or '—'}"
+        )
         if signature_ok:
             _log_cicada_signature_kind(signature)
         if collision_offline and not signature_ok:
@@ -1275,9 +1362,9 @@ $result | ConvertTo-Json -Compress
         if signature_ok and not layout_ok:
             debug_log(
                 f"[SCAN] disk {disk_number} layout details: "
-                f"style={item.get('PartitionStyle')} count={item.get('PartitionCount')} "
-                f"p1={item.get('P1Size')}/{item.get('P1MbrType')} "
-                f"p2={item.get('P2Size')}/{item.get('P2MbrType')}"
+                f"style={partition_style} count={part_item.get('PartitionCount')} "
+                f"p1={part_item.get('P1Size')}/{part_item.get('P1MbrType')} "
+                f"p2={part_item.get('P2Size')}/{part_item.get('P2MbrType')}"
             )
         disks.append(
             UsbDisk(
@@ -1309,6 +1396,7 @@ $result | ConvertTo-Json -Compress
                 f"[SCAN]   disk {disk.number} model={disk.model!r} "
                 f"identity={disk_identity_key(disk)}"
             )
+    perf_log("list_usb_disks_fast total", total_started)
     return disks
 
 
@@ -1319,13 +1407,18 @@ def invalidate_usb_scan_cache() -> None:
 
 
 def list_usb_disks_fast_cached() -> tuple[list[UsbDisk], bool]:
-    """Быстрый список USB. Второй элемент — True, если результат взят из кеша (5 сек)."""
+    """Быстрый список USB. Второй элемент — True, если результат взят из кеша."""
     global _USB_SCAN_CACHE
     now = time.time()
     with _USB_SCAN_CACHE_LOCK:
         if _USB_SCAN_CACHE is not None:
             cached_at, cached_disks = _USB_SCAN_CACHE
-            if now - cached_at < _USB_SCAN_CACHE_TTL:
+            ttl = (
+                _USB_SCAN_CACHE_EMPTY_TTL
+                if len(cached_disks) == 0
+                else _USB_SCAN_CACHE_TTL
+            )
+            if now - cached_at < ttl:
                 return ([_copy_usb_disk(disk) for disk in cached_disks], True)
     disks = list_usb_disks_fast()
     with _USB_SCAN_CACHE_LOCK:
@@ -3976,31 +4069,35 @@ def verify_cicada_usb_flag(
     device_key: str | None = None,
 ) -> bool:
     """Проверяет .cicada3301.flag перед реальной операцией с разделом."""
-    if device_key and is_cicada_flag_verified_cached(device_key):
-        return True
-    if not FULL_HIDE_AFTER_CREATE:
-        from cicada_errors import debug_log
+    started = time.perf_counter()
+    try:
+        if device_key and is_cicada_flag_verified_cached(device_key):
+            return True
+        if not FULL_HIDE_AFTER_CREATE:
+            from cicada_errors import debug_log
 
-        try:
-            ntfs_root = resolve_visible_ntfs_path(disk_number)
-            if ntfs_root is None:
-                ntfs_root = ensure_visible_ntfs_path(disk_number)
-            debug_log(f"[MOUNT] visible mode: direct NTFS path {ntfs_root}, no reveal")
-            verified = is_cicada_usb(ntfs_root)
-        except Exception:
-            verified = False
+            try:
+                ntfs_root = resolve_visible_ntfs_path(disk_number)
+                if ntfs_root is None:
+                    ntfs_root = ensure_visible_ntfs_path(disk_number)
+                debug_log(f"[MOUNT] visible mode: direct NTFS path {ntfs_root}, no reveal")
+                verified = is_cicada_usb(ntfs_root)
+            except Exception:
+                verified = False
+            if verified and device_key:
+                mark_cicada_flag_verified_cached(device_key)
+            return verified
+        verified = disk_has_cicada_flag(
+            disk_number,
+            timeout=timeout,
+            fast_only=fast_only,
+            device_key=device_key,
+        )
         if verified and device_key:
             mark_cicada_flag_verified_cached(device_key)
         return verified
-    verified = disk_has_cicada_flag(
-        disk_number,
-        timeout=timeout,
-        fast_only=fast_only,
-        device_key=device_key,
-    )
-    if verified and device_key:
-        mark_cicada_flag_verified_cached(device_key)
-    return verified
+    finally:
+        perf_log("verify_cicada_usb_flag", started)
 
 
 def find_cicada_usb_disks() -> list[UsbDisk]:
@@ -4094,15 +4191,19 @@ def count_category_images(data_root: Path, category: str) -> int:
 
 
 def scan_partition_stats(ntfs_root: Path) -> dict[str, float | int]:
-    data_root = cicada_data_root(ntfs_root)
-    usage = shutil.disk_usage(str(ntfs_root))
-    return {
-        "windows": count_category_images(data_root, "WINDOWS"),
-        "linux": count_category_images(data_root, "LINUX"),
-        "winpe": count_category_images(data_root, "WINPE"),
-        "free_gb": usage.free / (1024**3),
-        "total_gb": usage.total / (1024**3),
-    }
+    started = time.perf_counter()
+    try:
+        data_root = cicada_data_root(ntfs_root)
+        usage = shutil.disk_usage(str(ntfs_root))
+        return {
+            "windows": count_category_images(data_root, "WINDOWS"),
+            "linux": count_category_images(data_root, "LINUX"),
+            "winpe": count_category_images(data_root, "WINPE"),
+            "free_gb": usage.free / (1024**3),
+            "total_gb": usage.total / (1024**3),
+        }
+    finally:
+        perf_log("scan_partition_stats", started)
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -4389,8 +4490,10 @@ exit
         )
 
 
-def ensure_cicada_partition_visible(disk_number: int) -> str:
-    """Раздел 1 (Cicada3301) — видимый NTFS с буквой диска, не скрытый."""
+def ensure_first_partition_visible(disk_number: int) -> str:
+    """Раздел 1 всегда видим: снять hidden/no-default-letter, назначить букву."""
+    from cicada_errors import debug_log
+
     letter = get_partition_drive_letter(disk_number, 1)
     try:
         state = _query_partition_mount_state(disk_number, 1)
@@ -4398,34 +4501,46 @@ def ensure_cicada_partition_visible(disk_number: int) -> str:
         state = {}
     if (
         letter
-        and _is_mbr_type_visible(state)
         and not bool(state.get("hidden"))
+        and not bool(state.get("no_default_drive_letter"))
+        and _is_mbr_type_visible(state)
     ):
+        debug_log("[REPAIR] first partition visible OK")
         return letter.upper()
+
     script = rf"""
 $ErrorActionPreference = 'Stop'
 $dn = {disk_number}
 Set-Partition -DiskNumber $dn -PartitionNumber 1 -IsHidden $false
 Set-Partition -DiskNumber $dn -PartitionNumber 1 -NoDefaultDriveLetter $false
-Set-Partition -DiskNumber $dn -PartitionNumber 1 -MbrType 0x07
+if ((Get-Partition -DiskNumber $dn -PartitionNumber 1).MbrType -in @(0x17, 23)) {{
+    Set-Partition -DiskNumber $dn -PartitionNumber 1 -MbrType 0x07
+}}
 Update-HostStorageCache
 """
     try:
         run_powershell(script)
-        return assign_free_letter(disk_number, 1)
     except Exception:
-        pass
-    run_diskpart(
-        f"""select disk {disk_number}
+        run_diskpart(
+            f"""select disk {disk_number}
 select partition 1
-set id=07
 attributes partition clear hidden
+set id=07
 assign
 exit
 """,
-        strict=False,
-    )
-    return assign_free_letter(disk_number, 1)
+            strict=False,
+        )
+    letter = get_partition_drive_letter(disk_number, 1)
+    if not letter:
+        letter = assign_free_letter(disk_number, 1)
+    debug_log("[REPAIR] first partition visible OK")
+    return letter.upper()
+
+
+def ensure_cicada_partition_visible(disk_number: int) -> str:
+    """Раздел 1 (Cicada3301) — видимый NTFS с буквой диска, не скрытый."""
+    return ensure_first_partition_visible(disk_number)
 
 
 def ensure_visible_ntfs_path(disk_number: int) -> Path:
@@ -4582,6 +4697,7 @@ class CreateWorker(QThread):
         fat_letter = letters[2]
         self.log.emit(f"Раздел 1 (NTFS): {ntfs_letter}:\\")
         self.log.emit(f"Раздел 2 (FAT32): {fat_letter}:\\")
+        ensure_first_partition_visible(self.disk.number)
         self.progress.emit(45)
 
         self.step_changed.emit(3)
@@ -4635,6 +4751,7 @@ class CreateWorker(QThread):
         except Exception as exc:
             self.log.emit(f"  предупреждение: {exc}")
 
+        ensure_first_partition_visible(self.disk.number)
         self.log.emit(f"  Cicada3301: {ntfs_letter}:\\ (видимый NTFS)")
 
         self.step_changed.emit(6)
@@ -5131,6 +5248,7 @@ class ImageDeleteWorker(QThread):
                     raise RuntimeError(
                         "Файл не найден на флешке и локальный кеш статистики недоступен."
                     )
+                ensure_first_partition_visible(self.disk.number)
                 self._emit_progress(self.STAGE_HIDE)
                 return
 
@@ -5157,6 +5275,7 @@ class ImageDeleteWorker(QThread):
             debug_log(f"[DELETE] final exists = {target.exists()}")
             debug_log("[DELETE] file deleted")
 
+            ensure_first_partition_visible(self.disk.number)
             self._emit_progress(self.STAGE_HIDE)
 
         self._emit_progress(self.STAGE_DONE)

@@ -264,9 +264,9 @@ def _get_logger() -> logging.Logger:
     if _logger is not None:
         return _logger
 
-    from cicada_usb_tool import cicada_temp_dir, ensure_runtime_dir
+    from cicada_usb_tool import ensure_runtime_dir
 
-    log_path = cicada_temp_dir() / "cicada_tool.log"
+    log_path = debug_log_path()
     ensure_runtime_dir(log_path.parent)
     logger = logging.getLogger("cicada_usb_tool")
     logger.setLevel(logging.DEBUG)
@@ -278,10 +278,41 @@ def _get_logger() -> logging.Logger:
     return logger
 
 
+def debug_log_path() -> Path:
+    from cicada_usb_tool import cicada_temp_dir, ensure_runtime_dir
+
+    path = cicada_temp_dir() / "cicada_tool.log"
+    ensure_runtime_dir(path.parent)
+    return path
+
+
+def open_debug_log_file() -> Path:
+    """Открыть cicada_tool.log в программе по умолчанию (Блокнот и т.п.)."""
+    import os
+    import subprocess
+    import sys
+
+    path = debug_log_path()
+    if not path.is_file():
+        path.touch()
+    if sys.platform == "win32":
+        os.startfile(path)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)], close_fds=True)
+    else:
+        subprocess.Popen(["xdg-open", str(path)], close_fds=True)
+    return path
+
+
 def debug_log(message: str) -> None:
     """Запись отладочных сообщений в cicada_tool.log."""
     if not is_logging_enabled():
         return
+    _get_logger().info(message)
+
+
+def write_debug_log_line(message: str) -> None:
+    """Запись строки в лог независимо от переключателя UI."""
     _get_logger().info(message)
 
 

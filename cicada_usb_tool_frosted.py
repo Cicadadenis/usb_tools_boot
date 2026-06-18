@@ -64,7 +64,9 @@ from cicada_errors import (
     exception_log_summary,
     is_logging_enabled,
     log_exception,
+    open_debug_log_file,
     set_logging_enabled,
+    write_debug_log_line,
 )
 from cicada_usb_tool import (
     CreateWorker,
@@ -82,6 +84,7 @@ from cicada_usb_tool import (
     CICADA_MBR_COLLISION_UI_MESSAGE_MULTILINE,
     clear_cached_partition_stats,
     clear_cicada_flag_verified_cache,
+    deep_audit_usb_disk,
     disk_identity_key,
     is_cicada_flag_verified_cached,
     mark_cicada_flag_verified_cached,
@@ -139,6 +142,71 @@ SIDEBAR_WIDTH = max(300, round(400 * UI_SCALE))
 
 def _s(value: int | float) -> int:
     return max(10 if value >= 10 else 8, round(value * UI_SCALE))
+
+
+def _qt_font_weight(weight: int) -> QFont.Weight:
+    if weight >= 900:
+        return QFont.Weight.Black
+    if weight >= 800:
+        return QFont.Weight.ExtraBold
+    if weight >= 700:
+        return QFont.Weight.Bold
+    if weight >= 600:
+        return QFont.Weight.DemiBold
+    return QFont.Weight.Normal
+
+
+def _sidebar_font(
+    font_px: int,
+    weight: int = 400,
+    *,
+    letter_spacing: float = 0.0,
+) -> QFont:
+    font = QFont()
+    font.setPixelSize(_s(font_px))
+    font.setWeight(_qt_font_weight(weight))
+    if letter_spacing:
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, letter_spacing)
+    return font
+
+
+def _label_line_height(label: QLabel, extra: int = 4) -> int:
+    return label.fontMetrics().height() + _s(extra)
+
+
+def _configure_sidebar_label(
+    label: QLabel,
+    *,
+    color: str,
+    font_px: int,
+    weight: int = 400,
+    letter_spacing: float = 0.0,
+) -> None:
+    label.setFont(_sidebar_font(font_px, weight, letter_spacing=letter_spacing))
+    label.setStyleSheet(f"{LABEL_PLAIN} color: {color};")
+    label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    label.setMinimumHeight(_label_line_height(label))
+    label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+
+def _apply_sidebar_footer_card_height(
+    card: QFrame,
+    layout: QVBoxLayout,
+    *,
+    min_height_px: int = 0,
+) -> None:
+    card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+    card.setMinimumHeight(max(_s(min_height_px), layout.sizeHint().height()))
+
+
+def _configure_sidebar_usb_line(label: QLabel, *, color: str, font_px: int, weight: int = 400) -> None:
+    _configure_sidebar_label(label, color=color, font_px=font_px, weight=weight)
+    label.setWordWrap(True)
+    label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
+
+def _set_sidebar_label_color(label: QLabel, color: str) -> None:
+    label.setStyleSheet(f"{LABEL_PLAIN} color: {color};")
 
 
 CONTENT_GAP_FROM_SIDEBAR = _s(10)
@@ -1149,6 +1217,53 @@ class UsbScanWorker(QThread):
             elapsed = time.perf_counter() - started
             debug_log(f"[SCAN] fast scan failed in {elapsed:.2f} sec: {exc}")
             self.error.emit(format_user_error_message(str(exc)))
+
+
+@dataclass
+class DeepAuditResult:
+    disk_number: int
+    disk_identity_key: str
+    target_unique_id: str | None
+    request_id: int
+    disk: UsbDisk
+
+
+class DeepAuditWorker(QThread):
+    """Глубокая проверка Cicada после отображения диска в UI."""
+
+    finished = pyqtSignal(object)
+    error = pyqtSignal(int, str)
+
+    def __init__(
+        self,
+        disk: UsbDisk,
+        request_id: int,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.disk = disk
+        self.request_id = request_id
+        self.target_disk_number = disk.number
+        self.target_unique_id = disk.unique_id
+        self.target_identity_key = disk_identity_key(disk)
+
+    def run(self) -> None:
+        try:
+            updated = deep_audit_usb_disk(self.disk)
+            self.finished.emit(
+                DeepAuditResult(
+                    self.target_disk_number,
+                    self.target_identity_key,
+                    self.target_unique_id,
+                    self.request_id,
+                    updated,
+                )
+            )
+        except Exception as exc:
+            self.error.emit(
+                self.target_disk_number,
+                format_user_error_message(str(exc)),
+            )
 
 
 class RefreshDiskButton(QPushButton):
@@ -3725,8 +3840,9 @@ def _sidebar_section_label(text: str) -> QLabel:
     lbl.setStyleSheet(
         f"{LABEL_PLAIN} color: {_rgba(COLORS['accent_cyan'], 0.65)};"
         f" font-size: {_s(10)}px; font-weight: 800; letter-spacing: 1.2px;"
-        f" padding: {_s(2)}px {_s(4)}px {_s(0)}px;"
+        f" padding: {_s(1)}px {_s(4)}px 0px;"
     )
+    lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
     return lbl
 
 
@@ -3817,14 +3933,19 @@ class _SidebarNavButton(QFrame):
         text_col = QVBoxLayout()
         text_col.setSpacing(_s(1))
         self._title = QLabel(title)
-        self._title.setStyleSheet(
-            f"{LABEL_PLAIN} color: {COLORS['text_primary']};"
-            f" font-size: {_s(13)}px; font-weight: 800; letter-spacing: 0.3px;"
+        _configure_sidebar_label(
+            self._title,
+            color=COLORS["text_primary"],
+            font_px=13,
+            weight=800,
+            letter_spacing=0.3,
         )
         self._subtitle = QLabel(subtitle)
-        self._subtitle.setStyleSheet(
-            f"{LABEL_PLAIN} color: {COLORS['text_muted']};"
-            f" font-size: {_s(10)}px; font-weight: 600;"
+        _configure_sidebar_label(
+            self._subtitle,
+            color=COLORS["text_muted"],
+            font_px=10,
+            weight=600,
         )
         text_col.addWidget(self._title)
         text_col.addWidget(self._subtitle)
@@ -3907,14 +4028,8 @@ class _SidebarNavButton(QFrame):
                 border-radius: {_s(12)}px;
             }}
         """)
-        self._title.setStyleSheet(
-            f"{LABEL_PLAIN} color: {title_color};"
-            f" font-size: {_s(13)}px; font-weight: 800; letter-spacing: 0.3px;"
-        )
-        self._subtitle.setStyleSheet(
-            f"{LABEL_PLAIN} color: {sub_color};"
-            f" font-size: {_s(10)}px; font-weight: 600;"
-        )
+        _set_sidebar_label_color(self._title, title_color)
+        _set_sidebar_label_color(self._subtitle, sub_color)
         counter_border = (
             _rgba(counter_color, 0.30)
             if counter_color.startswith("#")
@@ -3953,6 +4068,7 @@ class CicadaUsbTool(QMainWindow):
         self.base_dir = cicada_temp_dir()
         self.worker = None
         self._usb_scan_worker: UsbScanWorker | None = None
+        self._deep_audit_workers: list[DeepAuditWorker] = []
         self._flag_auto_worker: FlagAutoCheckWorker | None = None
         self._last_selected_disk_index = -1
         self.selected_disk_number: int | None = None
@@ -3982,8 +4098,9 @@ class CicadaUsbTool(QMainWindow):
         self._nav_buttons: list[_SidebarNavButton] = []
         self._active_nav_index = -1
         self._footer_stats: dict[str, QLabel] = {}
-        self._sidebar_system_status: QLabel | None = None
         self._sidebar_usb_lines: dict[str, QLabel] = {}
+        self._sidebar_usb_status: QFrame | None = None
+        self._sidebar_usb_lay: QVBoxLayout | None = None
         self._header_status: dict[str, QLabel] = {}
         self.setup_ui()
         self._enter_scanning_state(initial=True)
@@ -4078,6 +4195,7 @@ class CicadaUsbTool(QMainWindow):
         # ── Сайдбар ──────────────────────────────────────────────────
         sidebar = QFrame()
         sidebar.setFixedWidth(SIDEBAR_WIDTH)
+        sidebar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         sidebar.setStyleSheet(f"""
             QFrame {{
                 background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #06111f, stop:1 #020712);
@@ -4086,9 +4204,45 @@ class CicadaUsbTool(QMainWindow):
                 border-bottom-left-radius: 20px;
             }}
         """)
-        side_lay = QVBoxLayout(sidebar)
-        side_lay.setContentsMargins(_s(10), _s(10), _s(10), _s(10))
-        side_lay.setSpacing(_s(4))
+        sidebar_outer = QVBoxLayout(sidebar)
+        sidebar_outer.setContentsMargins(0, 0, 0, 0)
+        sidebar_outer.setSpacing(0)
+
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setObjectName("sidebarScroll")
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        sidebar_scroll.setStyleSheet(f"""
+            QScrollArea#sidebarScroll {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollArea#sidebarScroll > QWidget > QWidget {{
+                background: transparent;
+            }}
+            QScrollArea#sidebarScroll QScrollBar:vertical {{
+                background: transparent;
+                width: {_s(6)}px;
+                margin: 0;
+            }}
+            QScrollArea#sidebarScroll QScrollBar::handle:vertical {{
+                background: {_rgba(COLORS['accent_purple'], 0.45)};
+                border-radius: {_s(3)}px;
+                min-height: {_s(24)}px;
+            }}
+            QScrollArea#sidebarScroll QScrollBar::add-line:vertical,
+            QScrollArea#sidebarScroll QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+        """)
+
+        scroll_content = QWidget()
+        scroll_content.setStyleSheet("background: transparent; border: none;")
+        side_lay = QVBoxLayout(scroll_content)
+        side_lay.setContentsMargins(_s(10), _s(8), _s(10), _s(8))
+        side_lay.setSpacing(_s(3))
 
         brand_card = QFrame()
         brand_card.setObjectName("sidebarBrandCard")
@@ -4111,30 +4265,33 @@ class CicadaUsbTool(QMainWindow):
         brand_text = QVBoxLayout()
         brand_text.setSpacing(_s(1))
         brand_name = QLabel("CICADA3301")
-        brand_name.setStyleSheet(
-            f"color: #ffffff; font-size: {_s(15)}px; font-weight: 900; letter-spacing: 0.6px;"
+        _configure_sidebar_label(
+            brand_name,
+            color="#ffffff",
+            font_px=15,
+            weight=900,
+            letter_spacing=0.6,
         )
         brand_suite = QLabel("Secure Boot Suite")
-        brand_suite.setStyleSheet(
-            f"color: {_rgba(COLORS['accent_cyan'], 0.90)};"
-            f" font-size: {_s(10)}px; font-weight: 600;"
+        _configure_sidebar_label(
+            brand_suite,
+            color=_rgba(COLORS["accent_cyan"], 0.90),
+            font_px=10,
+            weight=600,
         )
         brand_ver = QLabel(f"v{APP_VERSION} PRO")
-        brand_ver.setStyleSheet(
-            f"color: {_rgba(COLORS['accent_purple'], 1.0)};"
-            f" font-size: {_s(10)}px; font-weight: 800; letter-spacing: 0.4px;"
+        _configure_sidebar_label(
+            brand_ver,
+            color=_rgba(COLORS["accent_purple"], 1.0),
+            font_px=10,
+            weight=800,
+            letter_spacing=0.4,
         )
         brand_text.addWidget(brand_name)
         brand_text.addWidget(brand_suite)
         brand_text.addWidget(brand_ver)
         brand_top.addLayout(brand_text, stretch=1)
         brand_lay.addLayout(brand_top)
-        self._sidebar_system_status = QLabel("● SYSTEM READY")
-        self._sidebar_system_status.setStyleSheet(
-            f"color: {COLORS['accent_green']}; font-size: {_s(10)}px; font-weight: 800;"
-            f" letter-spacing: 0.5px;"
-        )
-        brand_lay.addWidget(self._sidebar_system_status)
         side_lay.addWidget(brand_card)
 
         nav_handlers = {
@@ -4165,7 +4322,6 @@ class CicadaUsbTool(QMainWindow):
             self._nav_buttons.append(btn)
             side_lay.addWidget(btn)
 
-        side_lay.addSpacing(_s(2))
         side_lay.addWidget(_sidebar_section_label("УПРАВЛЕНИЕ"))
         mgmt_offset = len(MEDIA_NAV_ITEMS)
         for nav_index, (title, icon_key, action, subtitle) in enumerate(MANAGEMENT_NAV_ITEMS):
@@ -4193,7 +4349,7 @@ class CicadaUsbTool(QMainWindow):
                 font-size: {_s(10)}px;
                 font-weight: 600;
                 text-align: left;
-                padding: {_s(2)}px {_s(6)}px;
+                padding: {_s(1)}px {_s(4)}px;
             }}
             QPushButton:hover {{
                 color: {COLORS['accent_cyan']};
@@ -4201,8 +4357,6 @@ class CicadaUsbTool(QMainWindow):
         """)
         about_btn.clicked.connect(self._show_about)
         side_lay.addWidget(about_btn)
-
-        side_lay.addStretch()
 
         logging_row = QFrame()
         logging_row.setObjectName("sidebarLoggingRow")
@@ -4214,18 +4368,61 @@ class CicadaUsbTool(QMainWindow):
             }}
             QFrame#sidebarLoggingRow QLabel {{ {LABEL_PLAIN} }}
         """)
-        logging_lay = QHBoxLayout(logging_row)
-        logging_lay.setContentsMargins(_s(10), _s(6), _s(10), _s(6))
-        logging_lay.setSpacing(_s(8))
+        logging_lay = QVBoxLayout(logging_row)
+        logging_lay.setContentsMargins(_s(10), _s(8), _s(10), _s(8))
+        logging_lay.setSpacing(_s(6))
+        logging_top = QHBoxLayout()
+        logging_top.setSpacing(_s(6))
         logging_lbl = QLabel("Логирование")
-        logging_lbl.setStyleSheet(
-            f"color: {COLORS['text_primary']}; font-size: {_s(11)}px; font-weight: 700;"
+        _configure_sidebar_label(
+            logging_lbl,
+            color=COLORS["text_primary"],
+            font_px=11,
+            weight=700,
         )
-        logging_lay.addWidget(logging_lbl, stretch=1)
+        logging_lbl.setMinimumHeight(_label_line_height(logging_lbl, extra=2))
+        logging_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        logging_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        logging_top.addWidget(
+            logging_lbl,
+            stretch=1,
+            alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+        )
         self.logging_toggle = _ToggleSwitch(is_logging_enabled())
         self.logging_toggle.toggled.connect(self._on_logging_toggled)
-        logging_lay.addWidget(self.logging_toggle)
+        logging_top.addWidget(
+            self.logging_toggle,
+            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        logging_lay.addLayout(logging_top)
+        open_log_btn = QPushButton("Открыть файл лога")
+        open_log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_log_btn.setFont(_sidebar_font(10, 700))
+        open_log_btn.setMinimumHeight(open_log_btn.fontMetrics().height() + _s(12))
+        open_log_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        open_log_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(0,229,255,0.08);
+                color: {COLORS['accent_cyan']};
+                border: 1px solid {_rgba(COLORS['accent_cyan'], 0.35)};
+                border-radius: {_s(8)}px;
+                padding: {_s(4)}px {_s(8)}px;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background: rgba(0,229,255,0.16);
+            }}
+        """)
+        open_log_btn.clicked.connect(self._on_open_log_clicked)
+        logging_lay.addWidget(open_log_btn)
+        logging_row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        logging_row.setMinimumHeight(logging_lay.sizeHint().height())
         side_lay.addWidget(logging_row)
+
+        side_lay.addStretch(1)
 
         usb_status = QFrame()
         usb_status.setObjectName("sidebarUsbStatus")
@@ -4241,12 +4438,17 @@ class CicadaUsbTool(QMainWindow):
         """)
         usb_lay = QVBoxLayout(usb_status)
         usb_lay.setContentsMargins(_s(10), _s(8), _s(10), _s(8))
-        usb_lay.setSpacing(_s(3))
+        usb_lay.setSpacing(_s(4))
         usb_title = QLabel("USB STATUS")
-        usb_title.setStyleSheet(
-            f"color: {_rgba(COLORS['accent_cyan'], 0.85)};"
-            f" font-size: {_s(10)}px; font-weight: 800; letter-spacing: 1px;"
+        _configure_sidebar_label(
+            usb_title,
+            color=_rgba(COLORS["accent_cyan"], 0.85),
+            font_px=10,
+            weight=800,
+            letter_spacing=1.0,
         )
+        usb_title.setMinimumHeight(_label_line_height(usb_title, extra=2))
+        usb_title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         usb_lay.addWidget(usb_title)
         for key, text, color in (
             ("boot", "CICADA USB BOOT", COLORS["text_muted"]),
@@ -4254,12 +4456,17 @@ class CicadaUsbTool(QMainWindow):
             ("mbr", "MBR Signature —", COLORS["text_muted"]),
         ):
             line = QLabel(text)
-            line.setStyleSheet(
-                f"color: {color}; font-size: {_s(10)}px; font-weight: 700;"
-            )
+            _configure_sidebar_usb_line(line, color=color, font_px=10, weight=700)
             self._sidebar_usb_lines[key] = line
             usb_lay.addWidget(line)
+        self._sidebar_usb_status = usb_status
+        self._sidebar_usb_lay = usb_lay
+        usb_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        usb_status.setMinimumHeight(usb_lay.sizeHint().height())
         side_lay.addWidget(usb_status)
+
+        sidebar_scroll.setWidget(scroll_content)
+        sidebar_outer.addWidget(sidebar_scroll)
 
         shell_layout.addWidget(sidebar)
 
@@ -4457,7 +4664,6 @@ class CicadaUsbTool(QMainWindow):
         """)
         self._set_active_nav(0)
         self._update_sidebar_usb_status()
-        self._update_sidebar_system_status()
         self._update_header_status()
 
     def _set_create_btn_normal(self) -> None:
@@ -4645,6 +4851,11 @@ class CicadaUsbTool(QMainWindow):
         self._stop_flag_auto_worker(wait=False)
         self._stop_stats_cache_worker(wait=False)
         self._stop_stats_scan_worker(wait=False)
+        self._deep_audit_workers = [
+            worker
+            for worker in self._deep_audit_workers
+            if worker is not None and worker.isRunning()
+        ]
 
     def _stop_flag_auto_worker(self, *, wait: bool = False) -> None:
         worker = self._flag_auto_worker
@@ -4813,63 +5024,35 @@ class CicadaUsbTool(QMainWindow):
             return
         if disk is None:
             boot.setText("CICADA USB BOOT")
-            boot.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['text_muted']};"
-                f" font-size: {_s(10)}px; font-weight: 700;"
-            )
+            _set_sidebar_label_color(boot, COLORS["text_muted"])
             protected.setText("Protected Mode —")
-            protected.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['text_muted']};"
-                f" font-size: {_s(10)}px; font-weight: 700;"
-            )
+            _set_sidebar_label_color(protected, COLORS["text_muted"])
             mbr.setText("MBR Signature —")
-            mbr.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['text_muted']};"
-                f" font-size: {_s(10)}px; font-weight: 700;"
-            )
+            _set_sidebar_label_color(mbr, COLORS["text_muted"])
             return
         if self.selected_disk_is_cicada:
             boot.setText("CICADA USB BOOT")
-            boot.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['accent_green']};"
-                f" font-size: {_s(10)}px; font-weight: 800;"
-            )
+            _set_sidebar_label_color(boot, COLORS["accent_green"])
         else:
             boot.setText("CICADA USB BOOT —")
-            boot.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['text_muted']};"
-                f" font-size: {_s(10)}px; font-weight: 700;"
-            )
+            _set_sidebar_label_color(boot, COLORS["text_muted"])
         if disk.cicada_verified:
             protected.setText("Protected Mode")
-            protected.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['accent_cyan']};"
-                f" font-size: {_s(10)}px; font-weight: 800;"
-            )
+            _set_sidebar_label_color(protected, COLORS["accent_cyan"])
         elif self.selected_disk_is_cicada:
             protected.setText("Protected Mode · sync")
-            protected.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['accent_yellow']};"
-                f" font-size: {_s(10)}px; font-weight: 700;"
-            )
+            _set_sidebar_label_color(protected, COLORS["accent_yellow"])
         else:
             protected.setText("Protected Mode —")
-            protected.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['text_muted']};"
-                f" font-size: {_s(10)}px; font-weight: 700;"
-            )
+            _set_sidebar_label_color(protected, COLORS["text_muted"])
         if disk.fast_is_cicada_signature:
             mbr.setText("MBR Signature OK")
-            mbr.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['accent_green']};"
-                f" font-size: {_s(10)}px; font-weight: 800;"
-            )
+            _set_sidebar_label_color(mbr, COLORS["accent_green"])
         else:
             mbr.setText("MBR Signature —")
-            mbr.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['text_muted']};"
-                f" font-size: {_s(10)}px; font-weight: 700;"
-            )
+            _set_sidebar_label_color(mbr, COLORS["text_muted"])
+        if self._sidebar_usb_status is not None and self._sidebar_usb_lay is not None:
+            _apply_sidebar_footer_card_height(self._sidebar_usb_status, self._sidebar_usb_lay)
 
     def _set_header_status_label(self, key: str, text: str, color: str, *, active: bool) -> None:
         lbl = self._header_status.get(key)
@@ -4903,28 +5086,6 @@ class CicadaUsbTool(QMainWindow):
             )
         else:
             self._set_header_status_label("protected", "● PROTECTED —", "#b36bff", active=False)
-
-    def _update_sidebar_system_status(self) -> None:
-        if self._sidebar_system_status is None:
-            return
-        if self._scanning:
-            self._sidebar_system_status.setText("● SCANNING")
-            self._sidebar_system_status.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['accent_cyan']};"
-                f" font-size: {_s(10)}px; font-weight: 800; letter-spacing: 0.5px;"
-            )
-        elif self._is_ui_locked():
-            self._sidebar_system_status.setText("● SYSTEM BUSY")
-            self._sidebar_system_status.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['accent_yellow']};"
-                f" font-size: {_s(10)}px; font-weight: 800; letter-spacing: 0.5px;"
-            )
-        else:
-            self._sidebar_system_status.setText("● SYSTEM READY")
-            self._sidebar_system_status.setStyleSheet(
-                f"{LABEL_PLAIN} color: {COLORS['accent_green']};"
-                f" font-size: {_s(10)}px; font-weight: 800; letter-spacing: 0.5px;"
-            )
 
     def _update_action_buttons_state(self) -> None:
         disk = self._selected_disk()
@@ -4968,7 +5129,6 @@ class CicadaUsbTool(QMainWindow):
         self.refresh_btn.setEnabled(not locked and not self._scanning)
 
         self._refresh_nav_styles()
-        self._update_sidebar_system_status()
         self._update_header_status()
 
     def _update_action_availability(self) -> None:
@@ -5667,7 +5827,6 @@ class CicadaUsbTool(QMainWindow):
         if not self._scanning:
             self.disk_combo.setEnabled(not locked)
             self.disk_selector.setEnabled(not locked)
-        self._update_sidebar_system_status()
         self._update_header_status()
         self._update_cicada_ui_state()
         self._update_action_buttons_state()
@@ -5704,7 +5863,6 @@ class CicadaUsbTool(QMainWindow):
         self.scan_dots.start(dots_text)
         self.scan_progress.show()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        self._update_sidebar_system_status()
         self._update_header_status()
         self._update_action_buttons_state()
 
@@ -5720,7 +5878,6 @@ class CicadaUsbTool(QMainWindow):
         if not self._is_ui_locked():
             self.disk_combo.setEnabled(True)
             self.disk_selector.setEnabled(True)
-        self._update_sidebar_system_status()
         self._update_header_status()
         self._update_action_buttons_state()
 
@@ -6140,6 +6297,70 @@ class CicadaUsbTool(QMainWindow):
         if enabled:
             debug_log(f"[UI] Логирование {state}")
 
+    def _on_open_log_clicked(self) -> None:
+        write_debug_log_line("[UI] open log clicked")
+        open_debug_log_file()
+
+    def _prune_deep_audit_workers(self) -> None:
+        self._deep_audit_workers = [
+            worker
+            for worker in self._deep_audit_workers
+            if worker is not None and worker.isRunning()
+        ]
+
+    def _start_deep_audit_workers(self, disks: list[UsbDisk]) -> None:
+        self._prune_deep_audit_workers()
+        request_id = self.current_request_id
+        for disk in disks:
+            if not (disk.fast_is_cicada_signature or disk.mbr_collision_offline):
+                continue
+            worker = DeepAuditWorker(disk, request_id, self)
+            self._deep_audit_workers.append(worker)
+            worker.finished.connect(self._on_deep_audit_finished)
+            worker.error.connect(self._on_deep_audit_error)
+            worker.finished.connect(worker.deleteLater)
+            worker.error.connect(worker.deleteLater)
+            worker.start()
+
+    def _update_combo_disk(self, updated: UsbDisk) -> bool:
+        identity = disk_identity_key(updated)
+        changed = False
+        for index in range(self.disk_combo.count()):
+            disk = self._combo_disk_at(index)
+            if disk is None or disk_identity_key(disk) != identity:
+                continue
+            prev = self._combo_disk_at(index)
+            if prev is not None:
+                self._merge_disk_scan_state(updated, prev)
+            self.disk_combo.setItemData(index, updated, Qt.ItemDataRole.UserRole)
+            changed = True
+            break
+        return changed
+
+    def _on_deep_audit_finished(self, result: DeepAuditResult) -> None:
+        self._prune_deep_audit_workers()
+        if self._is_stale_request(result.request_id):
+            debug_log(
+                f"[DEEP] ignore stale result disk={result.disk_number}"
+            )
+            return
+        invalidate_usb_scan_cache()
+        if not self._update_combo_disk(result.disk):
+            return
+        selected = self._selected_disk()
+        if selected is not None and disk_identity_key(selected) == result.disk_identity_key:
+            self.update_ui_for_selected_disk()
+            if result.disk.is_cicada:
+                self.append_log(
+                    f"Cicada USB Boot подтверждён на диске {result.disk_number}",
+                    "ok",
+                )
+            self._schedule_disk_pipeline(result.disk)
+
+    def _on_deep_audit_error(self, disk_number: int, message: str) -> None:
+        self._prune_deep_audit_workers()
+        debug_log(f"[DEEP] audit failed disk={disk_number}: {message}")
+
     def append_log(self, text: str, level: str = "info") -> None:
         if not is_logging_enabled():
             return
@@ -6259,6 +6480,7 @@ class CicadaUsbTool(QMainWindow):
         finally:
             self._leave_scanning_state()
             self._on_disk_changed(refresh_stats=initial)
+            self._start_deep_audit_workers(disks)
             if not initial:
                 disk = self._selected_disk()
                 if disk is not None and self._disk_fast_cicada(disk):
